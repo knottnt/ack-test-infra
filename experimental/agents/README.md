@@ -24,7 +24,23 @@ The ACK Agent provides a conversational interface to help you work with AWS Cont
 
 This project uses `uv` for dependency management. If you don't have `uv` installed, you can install it following the [official installation instructions](https://github.com/astral-sh/uv#installation).
 
+### Install Development Dependencies (Optional)
+```bash
+uv sync --extra dev 
+```
+
+To run the dev tool you can use
+
+```bash
+uv run <tool-name> <args>
+
+# For example
+uv run black .
+```
+
 ### Setting up the project
+
+#### AWS Resources
 
 1. OpenSearch Vector Store
 
@@ -62,6 +78,19 @@ uv run python -m ack_generator_agent --region us-east-1 --temperature 0.5 --debu
 - `--model`: Model ID for Claude on Bedrock (default: us.anthropic.claude-3-7-sonnet-20250219-v1:0)
 - `--temperature`: Temperature for model generation (default: 0.2)
 - `--debug`: Enable debug logging
+
+### Available Environment Variables
+
+- `OPENSEARCH_HOST`: OpenSearch Endpoint URL for memory storage and retrieval
+- `ack_root`: Path to root of ACK Git repos. Defaults to `~/aws-controllers-k8s`.
+- `ack_org_url`: URL for the aws-controller-k8s org. Defaults to `https://github.com/aws-controllers-k8s`.
+- `code_generator_url`: URL for the code-generator Git repo. Defaults to `{ack_org_url}/code-generator`.
+- `code_generator_path_override`: Overrides path to code-generator Git repo. If not set `{ack_root}/code-generator` is used.
+- `runtime_url`: URL for the runtime Git repo. Defaults to `{ack_org_url}/runtime`.
+- `runtime_path_override`: Overrides path to the runtime Git repo. If not set `{ack_root}/runtime` is used.
+- `aws_sdk_go_v2_url`: URL for the aws-sdk-go-v2 Git repo. Defaults to `https://github.com/aws/aws-sdk-go-v2.git`.
+- `aws_sdk_go_v2_path_override`: Overrides path to the aws-sdk-go-v2 Git repo. If not set `{ack_root}/aws-sdk-go-v2` is used.
+- `build_logs_dir_override`: Overrides path directory where build logs should be saved. If not set `{ack_root}/build_logs` is used.
 
 
 ## Available Tools
