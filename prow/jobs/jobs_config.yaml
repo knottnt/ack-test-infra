@@ -35,6 +35,7 @@ aws_services:
 - elbv2
 - emrcontainers
 - eventbridge
+- firehose
 - globalaccelerator
 - glue
 - iam
