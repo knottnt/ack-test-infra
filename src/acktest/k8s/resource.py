@@ -21,7 +21,7 @@ import distutils.util as util
 from datetime import datetime
 from pathlib import Path
 from time import sleep
-from typing import Dict, Optional, Union
+from typing import Callable, Dict, Optional, Sequence, Union
 from dataclasses import dataclass
 from kubernetes import config, client
 from kubernetes.client.api_client import ApiClient
@@ -349,6 +349,102 @@ def parse_condition_last_transition_time(condition) -> Optional[datetime]:
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
+# An abort check inspects the resource each poll and returns a human-readable
+# reason string to stop waiting early (the wait then fails), or None to keep
+# waiting. This keeps early-exit conditions extensible as data: add a new check
+# to the `abort_checks` list rather than a new parameter on the wait functions.
+AbortCheck = Callable[[CustomResourceReference], Optional[str]]
+
+
+def terminal_abort_check(reference: CustomResourceReference) -> Optional[str]:
+    """Abort check: stop waiting if the resource has gone terminal.
+
+    A resource with ACK.Terminal=True (e.g. the AWS API rejected the desired
+    state) will never reach ResourceSynced=True, so continuing to poll only
+    wastes time and obscures the real error. Returns the terminal message when
+    ACK.Terminal is True, otherwise None.
+    """
+    # Canonical constant: acktest.k8s.condition.CONDITION_TYPE_TERMINAL
+    terminal_condition = get_resource_condition(reference, "ACK.Terminal")
+    if terminal_condition is not None and terminal_condition['status'] == "True":
+        return f"ACK.Terminal=True: '{terminal_condition.get('message')}'"
+    return None
+
+
+def _wait_on_condition_impl(reference: CustomResourceReference,
+                            condition_name: str,
+                            desired_condition_status: str,
+                            wait_periods: int = 2,
+                            period_length: int = 60,
+                            last_transition_after: Optional[datetime] = None,
+                            abort_checks: Optional[Sequence[AbortCheck]] = None) -> bool:
+    """Core wait implementation combining all condition-wait behaviors.
+
+    This is the single internal implementation. Public wrappers (below) expose
+    specific combinations for backward-compatibility and ergonomics.
+
+    Args:
+        reference: the custom resource to poll.
+        condition_name: condition type to wait on (e.g. "ACK.ResourceSynced").
+        desired_condition_status: target status value (e.g. "True").
+        wait_periods: max poll iterations before timeout.
+        period_length: seconds between polls.
+        last_transition_after: when set, the condition is only considered met
+            once its lastTransitionTime is strictly newer than this value. This
+            guards against reading a stale condition left over from a previous
+            reconcile. Pass None to skip the freshness check.
+        abort_checks: optional sequence of callables evaluated each poll before
+            sleeping. Each takes the resource reference and returns a reason
+            string to abort the wait early (returning False), or None to keep
+            waiting. Use this to add early-exit guards (e.g. terminal state)
+            without growing the parameter list. See `terminal_abort_check`.
+
+    Returns:
+        True if the desired condition is met (with freshness, if requested).
+        False on timeout, an abort check firing, or missing resource/condition.
+    """
+    if not get_resource_exists(reference):
+        logging.error(f"Resource {reference} does not exist")
+        return False
+
+    desired_condition = None
+    for i in range(wait_periods):
+        logging.debug(f"Waiting on condition {condition_name} to reach {desired_condition_status} for resource {reference} ({i})")
+
+        desired_condition = get_resource_condition(reference, condition_name)
+        if desired_condition is not None and desired_condition['status'] == desired_condition_status:
+            # Freshness gate: if last_transition_after is set, only accept the
+            # condition when its timestamp proves it came from a new reconcile.
+            if last_transition_after is not None:
+                last_transition = parse_condition_last_transition_time(desired_condition)
+                if last_transition is None or last_transition <= last_transition_after:
+                    # Stale — keep polling for a fresh reconcile.
+                    sleep(period_length)
+                    continue
+                logging.info(f"Condition {condition_name} has status {desired_condition_status} with a fresh lastTransitionTime ({last_transition}), continuing...")
+            else:
+                logging.info(f"Condition {condition_name} has status {desired_condition_status}, continuing...")
+            return True
+
+        # Early-exit guards: any abort check that fires ends the wait now.
+        for check in (abort_checks or ()):
+            reason = check(reference)
+            if reason is not None:
+                logging.error(
+                    f"Aborting wait for {condition_name}={desired_condition_status} on "
+                    f"resource {reference}: {reason}"
+                )
+                return False
+
+        sleep(period_length)
+
+    if not desired_condition:
+        logging.error(f"Resource {reference} does not have a condition of type {condition_name}.")
+    else:
+        logging.error(f"Wait for condition {condition_name} to reach status {desired_condition_status} timed out. Condition has message '{desired_condition['message']}'")
+    return False
+
+
 def wait_on_condition(reference: CustomResourceReference,
                       condition_name: str,
                       desired_condition_status: str,
@@ -364,27 +460,10 @@ def wait_on_condition(reference: CustomResourceReference,
         False if the resource doesn't exist, have .status.conditions at all, have the requested
             condition type, or if the wait times out. True otherwise.
     """
-
-    if not get_resource_exists(reference):
-        logging.error(f"Resource {reference} does not exist")
-        return False
-
-    desired_condition = None
-    for i in range(wait_periods):
-        logging.debug(f"Waiting on condition {condition_name} to reach {desired_condition_status} for resource {reference} ({i})")
-
-        desired_condition = get_resource_condition(reference, condition_name)
-        if desired_condition is not None and desired_condition['status'] == desired_condition_status:
-            logging.info(f"Condition {condition_name} has status {desired_condition_status}, continuing...")
-            return True
-
-        sleep(period_length)
-
-    if not desired_condition:
-        logging.error(f"Resource {reference} does not have a condition of type {condition_name}.")
-    else:
-        logging.error(f"Wait for condition {condition_name} to reach status {desired_condition_status} timed out. Condition has message '{desired_condition['message']}'")
-    return False
+    return _wait_on_condition_impl(
+        reference, condition_name, desired_condition_status,
+        wait_periods=wait_periods, period_length=period_length,
+    )
 
 
 def wait_on_condition_after(reference: CustomResourceReference,
@@ -397,55 +476,76 @@ def wait_on_condition_after(reference: CustomResourceReference,
     Waits for the specified condition to reach the desired value via a reconcile
     that happened after `last_transition_after`.
 
-    This is a timestamp-aware variant of `wait_on_condition`. It is a separate
-    function (rather than an extra argument on `wait_on_condition`) to avoid any
-    behavioral change for existing callers.
+    This is a timestamp-aware variant of `wait_on_condition`. It guards against
+    reading a stale condition left over from a previous reconcile -- for example,
+    right after patching a resource, ACK.ResourceSynced can still read the
+    desired status from the prior reconcile. Capture the condition's
+    lastTransitionTime before the patch (see
+    condition.get_synced_last_transition_time) and pass it here to wait for a
+    fresh reconcile. When `last_transition_after` is None the timestamp check is
+    skipped, making this behave like `wait_on_condition`.
 
     Precondition:
         resource must be consumed by the controller (i.e. have a .status field)
-
-    Args:
-        last_transition_after: when provided, the condition is only considered
-            met once its lastTransitionTime is strictly newer than this value.
-            This guards against reading a stale condition left over from a
-            previous reconcile -- for example, right after patching a resource,
-            ACK.ResourceSynced can still read the desired status from the prior
-            reconcile. Capture the condition's lastTransitionTime before the
-            patch (see condition.get_synced_last_transition_time) and pass it
-            here to wait for a fresh reconcile. When None the timestamp check is
-            skipped, making this behave like `wait_on_condition`.
 
     Returns:
         False if the resource doesn't exist, have .status.conditions at all, have the requested
             condition type, or if the wait times out. True otherwise.
     """
+    return _wait_on_condition_impl(
+        reference, condition_name, desired_condition_status,
+        wait_periods=wait_periods, period_length=period_length,
+        last_transition_after=last_transition_after,
+    )
 
-    if not get_resource_exists(reference):
-        logging.error(f"Resource {reference} does not exist")
-        return False
 
-    desired_condition = None
-    for i in range(wait_periods):
-        logging.debug(f"Waiting on condition {condition_name} to reach {desired_condition_status} for resource {reference} ({i})")
+def wait_on_synced(reference: CustomResourceReference,
+                   last_transition_after: Optional[datetime] = None,
+                   wait_periods: int = 2,
+                   period_length: int = 60) -> bool:
+    """
+    Wait for a resource to reach ACK.ResourceSynced=True, failing fast if it
+    goes terminal. This is the recommended wait for the vast majority of e2e
+    tests — it fixes the standard `wait_on_condition(..., "ACK.ResourceSynced",
+    "True")` call in two ways:
 
-        desired_condition = get_resource_condition(reference, condition_name)
-        if desired_condition is not None and desired_condition['status'] == desired_condition_status:
-            if last_transition_after is None:
-                logging.info(f"Condition {condition_name} has status {desired_condition_status}, continuing...")
-                return True
+      1. Fails fast on ACK.Terminal=True instead of polling to the full timeout.
+         A resource whose desired state the API rejected will never sync, so
+         this surfaces the real error in seconds with its terminal message.
+      2. Optionally enforces reconcile freshness via `last_transition_after`, so
+         a stale pre-patch Synced=True is not mistaken for a fresh sync.
 
-            last_transition = parse_condition_last_transition_time(desired_condition)
-            if last_transition is not None and last_transition > last_transition_after:
-                logging.info(f"Condition {condition_name} has status {desired_condition_status} with a fresh lastTransitionTime ({last_transition}), continuing...")
-                return True
+    CREATE paths (nothing stale to guard against) — omit `last_transition_after`:
 
-        sleep(period_length)
+        k8s.create_custom_resource(ref, data)
+        k8s.wait_resource_consumed_by_controller(ref)
+        assert k8s.wait_on_synced(ref, wait_periods=10)
 
-    if not desired_condition:
-        logging.error(f"Resource {reference} does not have a condition of type {condition_name}.")
-    else:
-        logging.error(f"Wait for condition {condition_name} to reach status {desired_condition_status} timed out. Condition has message '{desired_condition['message']}'")
-    return False
+    UPDATE paths — capture the synced timestamp BEFORE patching, then pass it in.
+    The capture MUST happen before the patch: capturing it afterward re-enters
+    the race this guards against (the controller may not have reconciled yet, so
+    the timestamp could still be the stale pre-patch value).
+
+        before = condition.get_synced_last_transition_time(ref)  # BEFORE patch
+        k8s.patch_custom_resource(ref, updates)
+        assert k8s.wait_on_synced(ref, last_transition_after=before, wait_periods=10)
+
+    Precondition:
+        resource must be consumed by the controller (i.e. have a .status field)
+
+    Returns:
+        True once the resource is (freshly, if requested) synced.
+        False if it goes terminal, the wait times out, or the resource is gone.
+    """
+    return _wait_on_condition_impl(
+        reference,
+        # Canonical constant: acktest.k8s.condition.CONDITION_TYPE_RESOURCE_SYNCED.
+        "ACK.ResourceSynced",
+        "True",
+        wait_periods=wait_periods, period_length=period_length,
+        last_transition_after=last_transition_after,
+        abort_checks=[terminal_abort_check],
+    )
 
 def get_resource_condition(reference: CustomResourceReference, condition_name: str):
     """
